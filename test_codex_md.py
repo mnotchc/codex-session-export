@@ -109,16 +109,19 @@ class ExportTests(unittest.TestCase):
 
     def test_chained_history_without_database(self):
         first_rows = [self.meta()] + task('first')
-        self.rollout(f'rollout-first-{THREAD}.jsonl', first_rows)
+        first = self.rollout(f'rollout-first-{THREAD}.jsonl', first_rows)
         second_rows = [self.meta(timestamp='2026-01-02T00:00:00Z', base=self.base_reference(first_rows))]
         second_rows += task('second', '2026-01-02T00:00:00Z')
-        self.rollout(f'rollout-second-{THREAD}_{FORK}.jsonl', second_rows)
-        last = self.rollout(f'rollout-last-{THREAD}.jsonl', [
-            self.meta(timestamp='2026-01-03T00:00:00Z', base=self.base_reference(second_rows)),
-        ] + task('third', '2026-01-03T00:00:00Z'))
-        parser = exporter.SessionParser(last)
-        self.assertEqual(parser.get_turn_count(), 3)
-        self.assertEqual(len(parser.source_paths), 3)
+        second = self.rollout(f'rollout-second-{THREAD}_{FORK}.jsonl', second_rows)
+        for reference_id in (THREAD, FORK):
+            with self.subTest(reference_id=reference_id):
+                last = self.rollout(f'rollout-last-{THREAD}.jsonl', [
+                    self.meta(timestamp='2026-01-03T00:00:00Z',
+                              base=self.base_reference(second_rows, reference_id)),
+                ] + task('third', '2026-01-03T00:00:00Z'))
+                parser = exporter.SessionParser(last)
+                self.assertEqual(parser.get_turn_count(), 3)
+                self.assertEqual(parser.source_paths, [first, second, last])
 
     def test_missing_base_fails_instead_of_exporting_partial_history(self):
         path = self.rollout(f'rollout-tail-{FORK}.jsonl', [
@@ -172,16 +175,22 @@ class ExportTests(unittest.TestCase):
         self.assertIn('missing history', output.getvalue())
 
     def test_browser_groups_pages_and_preserves_filename_aliases(self):
+        middle_id = '33333333-3333-4333-8333-333333333333'
+        tail_id = '44444444-4444-4444-8444-444444444444'
         rows = [self.meta()] + task('first')
         self.rollout(f'rollout-first-{THREAD}.jsonl', rows)
-        tail = self.rollout(f'rollout-second-{THREAD}_{FORK}.jsonl', [
+        middle_rows = [
             self.meta(timestamp='2026-01-02T00:00:00Z', base=self.base_reference(rows)),
-        ] + task('second', '2026-01-02T00:00:00Z'))
+        ] + task('second', '2026-01-02T00:00:00Z')
+        self.rollout(f'rollout-second-{THREAD}_{middle_id}.jsonl', middle_rows)
+        tail = self.rollout(f'rollout-third-{THREAD}_{tail_id}.jsonl', [
+            self.meta(timestamp='2026-01-03T00:00:00Z', base=self.base_reference(middle_rows, middle_id)),
+        ] + task('third', '2026-01-03T00:00:00Z'))
         with patch.object(exporter, 'SESSIONS_DIR', self.sessions):
             records = exporter.scan_sessions()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].path, tail)
-        self.assertTrue({THREAD, FORK}.issubset(records[0].aliases))
+        self.assertTrue({THREAD, middle_id, tail_id}.issubset(records[0].aliases))
 
     def test_legacy_turns_and_rollback(self):
         rows = [self.meta(), entry('response_item', message('user', '# AGENTS.md instructions for /project'))]
@@ -226,6 +235,41 @@ class ExportTests(unittest.TestCase):
                 settings = exporter.interactive_filter([parser])
             self.assertTrue(all(settings[0].values()))
             self.assertEqual(settings[1:], (False, 0, 0, 0, 0, 0))
+
+    def test_export_discards_images_from_messages_and_tool_output(self):
+        jpeg = {'type': 'input_image', 'image_url': 'data:image/jpeg;base64,JPEG_PAYLOAD'}
+        png = {'type': 'image', 'mimeType': 'image/png', 'data': 'PNG_PAYLOAD'}
+        user = message('user', 'Keep the prompt ![screenshot](https://example.com/screenshot.png)')
+        user['content'].append(jpeg)
+        output = '\n'.join((
+            'Tool text before',
+            json.dumps(jpeg),
+            json.dumps({'nested': json.dumps([png, {'type': 'text', 'text': 'Keep nested text'}])}),
+            'iVBORw0KGgo' + 'RAW_IMAGE_PAYLOAD' * 2,
+            'Tool text after',
+        ))
+        path = self.rollout(f'rollout-{THREAD}.jsonl', [
+            self.meta(),
+            entry('response_item', user),
+            entry('response_item', message('assistant', '<img src="photo.png">Keep the answer', 'output_text')),
+            entry('response_item', {
+                'type': 'function_call', 'name': 'exec_command', 'call_id': 'call',
+                'arguments': json.dumps({'attachment': png, 'cmd': 'echo keep'}),
+            }),
+            entry('response_item', {'type': 'function_call_output', 'call_id': 'call', 'output': output}),
+            entry('response_item', {
+                'type': 'custom_tool_call_output', 'call_id': 'custom',
+                'output': [png, {'type': 'text', 'text': 'Keep custom output data:image/png;base64,INLINE_PAYLOAD'}],
+            }),
+        ])
+
+        markdown = exporter.SessionParser(path).to_markdown()
+        for text in ('Keep the prompt', 'Keep the answer', 'Tool text before', 'Tool text after',
+                     'Keep nested text', 'echo keep', 'Keep custom output'):
+            self.assertIn(text, markdown)
+        for image_content in ('data:image', 'JPEG_PAYLOAD', 'PNG_PAYLOAD', 'INLINE_PAYLOAD',
+                              'RAW_IMAGE_PAYLOAD', 'input_image', 'image_url', 'screenshot.png', 'photo.png'):
+            self.assertNotIn(image_content, markdown)
 
 
 if __name__ == '__main__':

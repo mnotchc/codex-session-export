@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.7.0)
+Codex Session Manager & Markdown Converter  (v2.7.1)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -409,6 +409,66 @@ def _response_item_arguments(payload: Dict):
     ignored = {'type', 'id', 'call_id', 'status', 'internal_chat_message_metadata_passthrough'}
     return {key: value for key, value in payload.items() if key not in ignored}
 
+IMAGE_BLOCK_TYPES = ('image', 'input_image', 'output_image', 'image_url')
+IMAGE_JSON_HINT_RE = re.compile(r'data:image|"(?:input_image|output_image|image_url|image)(?=["\\/])', re.I)
+IMAGE_DATA_URI_RE = re.compile(
+    r"""data:image\\?/[a-z0-9.+-]+(?:;[^;,\s"'<>]+)*;base64,[a-z0-9+/_=%\\-]*""", re.I,
+)
+# PNG, JPEG, GIF and WebP signatures in Base64 without a data URI.
+IMAGE_BASE64_RE = re.compile(
+    r'(?<![A-Za-z0-9+/_-])(?:iVBORw0KGgo|/9j/|R0lGOD[dl]h|UklGR[A-Za-z0-9+/_-]{6}XRUJQ)'
+    r'[A-Za-z0-9+/_-]{24,}={0,2}',
+)
+IMAGE_MARKUP_RE = re.compile(
+    r'!\[[^\]\n]*\](?:\((?:[^()\n]|\([^()\n]*\))*\)|\[[^\]\n]*\])?'
+    r"""|<img\b(?:[^"'<>]|"[^"]*"|'[^']*')*>""",
+    re.I,
+)
+
+def _is_image_block(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    mime_type = value.get('mimeType', value.get('mime_type', ''))
+    return value.get('type') in IMAGE_BLOCK_TYPES or (
+        'data' in value and isinstance(mime_type, str) and mime_type.lower().startswith('image/')
+    )
+
+def _strip_json_images(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_json_images(item) for key, item in value.items()
+            if key != 'image_url' and not _is_image_block(item)
+        }
+    if isinstance(value, list):
+        return [_strip_json_images(item) for item in value if not _is_image_block(item)]
+    if isinstance(value, str):
+        return _strip_export_images(value)
+    return value
+
+def _strip_export_images(text: str) -> str:
+    if IMAGE_JSON_HINT_RE.search(text):
+        # Tool output can contain JSON image blocks mixed with ordinary text.
+        decode = json.JSONDecoder().raw_decode
+        parts = []
+        cursor = 0
+        for match in re.finditer(r'[\[{]', text):
+            start = match.start()
+            if start < cursor:
+                continue
+            try:
+                value, end = decode(text, start)
+            except json.JSONDecodeError:
+                continue
+            parts.append(text[cursor:start])
+            if not _is_image_block(value):
+                cleaned = _strip_json_images(value)
+                parts.append(text[start:end] if cleaned == value else json.dumps(cleaned, ensure_ascii=False))
+            cursor = end
+        parts.append(text[cursor:])
+        text = ''.join(parts)
+    text = IMAGE_DATA_URI_RE.sub('', text)
+    return IMAGE_MARKUP_RE.sub('', IMAGE_BASE64_RE.sub('', text))
+
 def _normalize_tool_output(value) -> str:
     if value is None:
         return ''
@@ -417,6 +477,8 @@ def _normalize_tool_output(value) -> str:
     if isinstance(value, list):
         return ''.join(_normalize_tool_output(item) for item in value)
     if isinstance(value, dict):
+        if _is_image_block(value):
+            return ''
         if isinstance(value.get('text'), str):
             return value['text']
         if 'output' in value:
@@ -570,6 +632,7 @@ def trim_chat_content(content: str) -> str:
     return cleaned.strip()
 
 def normalize_title_candidate(text: str) -> str:
+    text = _strip_export_images(text)
     text = re.sub(r'\s+', ' ', text.strip())
     return text[:80] + ("..." if len(text) > 80 else "")
 
@@ -886,7 +949,10 @@ def load_rollout_history(path: Path, seen=None, limit=None):
                 candidate_meta, _, _ = read_session_summary(candidate)
             except SessionReadError:
                 continue
-            if not candidate_meta or candidate_meta.get('id') != thread_id:
+            if not candidate_meta:
+                continue
+            # A paginated history reference can name the segment in the filename.
+            if thread_id not in (candidate_meta.get('id'), _rollout_session_id(candidate)):
                 continue
             timestamp = candidate_meta.get('timestamp', '')
             if timestamp >= meta.get('timestamp', ''):
@@ -926,7 +992,7 @@ def _text_from_message_content(content) -> str:
     if isinstance(content, list):
         parts: List[str] = []
         for part in content:
-            if isinstance(part, dict):
+            if isinstance(part, dict) and not _is_image_block(part):
                 text = part.get('text')
                 if isinstance(text, str):
                     parts.append(text)
@@ -935,7 +1001,7 @@ def _text_from_message_content(content) -> str:
         return '\n'.join(parts).strip()
     if isinstance(content, str):
         return content.strip()
-    if content is None:
+    if content is None or _is_image_block(content):
         return ""
     return str(content).strip()
 
@@ -1940,6 +2006,7 @@ class SessionParser:
             content = item.get('content', '')
             if isinstance(content, list): content = '\n'.join(str(x) for x in content)
             elif not isinstance(content, str): content = str(content)
+            content = _strip_export_images(content)
 
             if itype == 'user_message':
                 if clean_content:
@@ -1983,13 +2050,14 @@ class SessionParser:
                     lang = "text"
                 emoji_map = {'terminal_cmd': '💻', 'mcp_tool': '🔌', 'other_tool': '🧩'}
                 em = emoji_map.get(itype, '🛠️')
+                args = _strip_export_images(args)
                 md.append(f"### {em} Tool: `{name}`\n\n```{lang}\n{args}\n```\n")
 
             elif itype in ('terminal_output', 'mcp_tool_output', 'other_tool_output'):
                 out = item.get('output', '')
                 if isinstance(out, list): out = '\n'.join(str(x) for x in out)
                 elif not isinstance(out, str): out = str(out)
-                out = _cap_text(out)
+                out = _cap_text(_strip_export_images(out))
                 if out.strip():
                     md.append(f"**Output:**\n\n```text\n{out}\n```\n")
 
@@ -2596,12 +2664,17 @@ def scan_sessions() -> List[SessionRecord]:
 
     for index, (record, meta, timestamp) in enumerate(scanned):
         base = meta.get('history_base')
-        if not isinstance(base, dict) or base.get('thread_id') != meta.get('id'):
+        if not isinstance(base, dict):
+            continue
+        session_id = meta.get('id')
+        base_id = base.get('thread_id')
+        if not isinstance(session_id, str) or not isinstance(base_id, str):
             continue
         candidate_indices = [
             j for j, (prior, prior_meta, prior_ts) in enumerate(scanned)
-            if j != index and prior_meta.get('id') == base['thread_id']
+            if j != index and prior_meta.get('id') == session_id
             and prior_ts < timestamp
+            and (base_id == session_id or _rollout_session_id(prior.path) == base_id)
         ]
         if candidate_indices:
             best = max(candidate_indices, key=lambda j: (scanned[j][2], scanned[j][0].mtime))
@@ -2645,7 +2718,7 @@ def group_by_project(records: List[SessionRecord]) -> List[Dict]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.7.0{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.7.1{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Default output: {script_directory()}{Style.RESET}\n")
 
